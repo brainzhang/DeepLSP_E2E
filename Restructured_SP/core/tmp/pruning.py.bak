@@ -1,0 +1,613 @@
+import os
+import sys
+import importlib
+import importlib.util
+import torch
+import torch.nn as nn
+import torch.nn.utils.prune as prune
+import copy
+import logging
+from typing import Dict, Any, List, Tuple, Optional
+from pathlib import Path
+
+# pyright: reportCallIssue=false
+
+class StructuredPruning:
+    """
+    Class for structured pruning of neural networks
+    
+    This class implements structured pruning methods for convolutional neural networks
+    focusing on different structured pruning approaches to reduce model size and computation.
+    """
+    
+    def __init__(self, model: nn.Module, pruning_ratio: float = 0.5):
+        """
+        Initialize structured pruning.
+        
+        Args:
+            model: PyTorch model to prune
+            pruning_ratio: Fraction of parameters to prune (0.0 - 1.0)
+        """
+        self.model = model
+        self.pruning_ratio = pruning_ratio
+        self.device = next(model.parameters()).device
+        
+        # Save original model weights for comparison
+        self.original_model = copy.deepcopy(model)
+        
+        # List to store prunable layers
+        self.prunable_layers = []
+        
+        # Identify prunable layers (Conv2d)
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Conv2d):
+                # Skip depthwise convolutions (groups == in_channels)
+                if module.groups == 1 or module.groups < module.in_channels:
+                    self.prunable_layers.append((name, module))
+        
+        logging.info(f"🔍 Found {len(self.prunable_layers)} prunable layers")
+    
+    def _prune_channels(self, global_pruning: bool = True) -> Dict[str, int]:
+        """
+        Channel pruning - prunes entire output channels from convolutional layers
+        based on their L1 norm importance.
+        
+        Args:
+            global_pruning: Whether to apply global pruning across all layers
+            
+        Returns:
+            Dictionary mapping layer names to number of pruned channels
+        """
+        pruned_channels = {}
+        pruned_layers = 0
+        
+        # Calculate channel importance for each layer using L1 norm
+        importance_scores = {}
+        for name, module in self.prunable_layers:
+            weight = module.weight.data
+            out_channels = weight.shape[0]
+            
+            # Calculate L1 norm for each output channel
+            importance = torch.sum(torch.abs(weight.view(out_channels, -1)), dim=1)
+            importance_scores[name] = importance
+        
+        if global_pruning:
+            # Global pruning - prune channels across all layers based on importance
+            all_importances = []
+            name_maps = []
+            
+            # Collect all importance scores
+            for name, importance in importance_scores.items():
+                for i, imp in enumerate(importance):
+                    all_importances.append(imp.item())
+                    name_maps.append((name, i))
+            
+            # Sort channels by importance
+            sorted_indices = torch.argsort(torch.tensor(all_importances)).tolist()
+            
+            # Calculate total channels to prune
+            total_channels = len(all_importances)
+            num_to_prune = int(total_channels * self.pruning_ratio)
+            
+            # Create map of channels to prune for each layer
+            channels_to_prune = {}
+            for idx in sorted_indices[:num_to_prune]:
+                name, channel = name_maps[idx]
+                if name not in channels_to_prune:
+                    channels_to_prune[name] = []
+                channels_to_prune[name].append(channel)
+            
+            # Apply pruning masks to each layer
+            for name, channels in channels_to_prune.items():
+                module = dict(self.prunable_layers)[name]
+                out_channels = module.weight.shape[0]
+                
+                # Create mask for this layer
+                mask = torch.ones_like(module.weight.data)
+                for channel in channels:
+                    mask[channel, :, :, :] = 0
+                
+                # Apply the mask
+                with torch.no_grad():
+                    module.weight.data *= mask
+                
+                if module.bias is not None:
+                    # Create bias mask
+                    bias_mask = torch.ones_like(module.bias.data)
+                    for channel in channels:
+                        bias_mask[channel] = 0
+                    
+                    # Apply the bias mask
+                    with torch.no_grad():
+                        module.bias.data *= bias_mask
+                
+                pruned_channels[name] = len(channels)
+                logging.info(f"🔧 Channel pruning: {name}, pruned {len(channels)}/{out_channels} "
+                            f"channels ({len(channels)/out_channels*100:.2f}%)")
+                pruned_layers += 1
+        else:
+            # Layer-wise pruning - prune channels in each layer independently
+            for name, importance in importance_scores.items():
+                module = dict(self.prunable_layers)[name]
+                out_channels = module.weight.shape[0]
+                
+                # Ensure we don't prune all channels
+                if out_channels <= 1:
+                    logging.warning(f"⚠️ Skipping pruning for {name}, not enough channels")
+                    continue
+                
+                # Calculate how many channels to prune in this layer
+                num_to_prune = max(1, int(out_channels * self.pruning_ratio))
+                num_to_keep = out_channels - num_to_prune
+                
+                # Ensure we keep at least one channel
+                if num_to_keep <= 0:
+                    num_to_keep = 1
+                    num_to_prune = out_channels - num_to_keep
+                
+                # Find channels to prune (lowest importance)
+                _, sorted_indices = torch.sort(importance)
+                channels_to_prune = sorted_indices[:num_to_prune].tolist()
+                
+                # Create mask for this layer
+                mask = torch.ones_like(module.weight.data)
+                for channel in channels_to_prune:
+                    mask[channel, :, :, :] = 0
+                
+                # Apply the mask
+                with torch.no_grad():
+                    module.weight.data *= mask
+                
+                if module.bias is not None:
+                    # Create bias mask
+                    bias_mask = torch.ones_like(module.bias.data)
+                    for channel in channels_to_prune:
+                        bias_mask[channel] = 0
+                    
+                    # Apply the bias mask
+                    with torch.no_grad():
+                        module.bias.data *= bias_mask
+                
+                pruned_channels[name] = len(channels_to_prune)
+                logging.info(f"🔧 Channel pruning: {name}, pruned {len(channels_to_prune)}/{out_channels} "
+                            f"channels ({len(channels_to_prune)/out_channels*100:.2f}%)")
+                pruned_layers += 1
+        
+        if pruned_layers == 0:
+            logging.warning("⚠️ No layers were pruned during channel pruning")
+        
+        return pruned_channels
+    
+    def _prune_kernels(self, global_pruning: bool = True) -> Dict[str, int]:
+        """
+        Kernel pruning - prunes entire convolutional kernels based on their L1 norm.
+        
+        Args:
+            global_pruning: Whether to apply global pruning across all layers
+            
+        Returns:
+            Dictionary mapping layer names to number of pruned kernels
+        """
+        pruned_kernels = {}
+        pruned_layers = 0
+        
+        for name, module in self.prunable_layers:
+            if isinstance(module, nn.Conv2d):
+                try:
+                    weight = module.weight.data
+                    n_filters = weight.shape[0]
+                    
+                    # Calculate L1 norm for each kernel
+                    l1_norm = torch.sum(torch.abs(weight.view(n_filters, -1)), dim=1)
+                    
+                    # Determine how many kernels to prune
+                    n_prune = max(1, int(n_filters * self.pruning_ratio))
+                    n_keep = n_filters - n_prune
+                    
+                    # Make sure we don't prune all kernels
+                    if n_keep <= 0:
+                        logging.warning(f"⚠️ Skipping kernel pruning for {name}, would remove all kernels")
+                        continue
+                    
+                    # Find kernels with lowest L1 norm
+                    indices_to_prune = torch.argsort(l1_norm)[:n_prune]
+                    
+                    # Create and apply mask
+                    mask = torch.ones_like(weight)
+                    for idx in indices_to_prune:
+                        mask[idx] = 0
+                    
+                    with torch.no_grad():
+                        module.weight.data *= mask
+                    
+                    # Also mask bias if present
+                    if module.bias is not None:
+                        bias_mask = torch.ones_like(module.bias.data)
+                        for idx in indices_to_prune:
+                            bias_mask[idx] = 0
+                        module.bias.data *= bias_mask
+                    
+                    pruned_kernels[name] = n_prune
+                    logging.info(f"🔧 Kernel pruning: {name}, pruned {n_prune}/{n_filters} "
+                                f"kernels ({n_prune/n_filters*100:.2f}%)")
+                    pruned_layers += 1
+                except Exception as e:
+                    logging.error(f"❌ Error pruning layer {name}: {e}")
+        
+        if pruned_layers == 0:
+            logging.warning("⚠️ No layers were pruned during kernel pruning")
+        
+        return pruned_kernels
+    
+    def _prune_intra_kernel(self) -> Dict[str, float]:
+        """
+        Intra-kernel pruning - prunes connections within convolutional kernels.
+        
+        Returns:
+            Dictionary mapping layer names to pruning ratios
+        """
+        pruning_ratios = {}
+        pruned_layers = 0
+        
+        for name, module in self.prunable_layers:
+            if isinstance(module, nn.Conv2d):
+                try:
+                    weight = module.weight.data
+                    
+                    # Check kernel size
+                    kernel_size = weight.shape[2:]
+                    if kernel_size[0] <= 1 or kernel_size[1] <= 1:
+                        logging.warning(f"⚠️ Skipping intra-kernel pruning for {name}, kernel too small")
+                        continue
+                    
+                    # Calculate stride based on pruning ratio
+                    stride = max(1, int(1 / (1 - self.pruning_ratio)))
+                    
+                    # Create mask for intra-kernel pruning
+                    mask = torch.ones_like(weight)
+                    if stride > 1:
+                        for i in range(kernel_size[0]):
+                            for j in range(kernel_size[1]):
+                                if (i % stride != 0) or (j % stride != 0):
+                                    mask[:, :, i, j] = 0
+                    
+                    # Apply mask
+                    with torch.no_grad():
+                        module.weight.data *= mask
+                    
+                    # Calculate actual pruning ratio
+                    total_weights = weight.numel()
+                    pruned_weights = total_weights - torch.sum(mask).item()
+                    actual_ratio = pruned_weights / total_weights
+                    
+                    pruning_ratios[name] = actual_ratio
+                    logging.info(f"🔧 Intra-kernel pruning: {name}, actual pruning ratio: {actual_ratio*100:.2f}%")
+                    pruned_layers += 1
+                except Exception as e:
+                    logging.error(f"❌ Error pruning layer {name}: {e}")
+        
+        if pruned_layers == 0:
+            logging.warning("⚠️ No layers were pruned during intra-kernel pruning")
+        
+        return pruning_ratios
+    
+    def prune_model(self, method: str = 'channel', global_pruning: bool = True) -> nn.Module:
+        """
+        Prune the model using structured pruning.
+        
+        Args:
+            method: Pruning method ('channel', 'kernel', or 'intra-kernel')
+            global_pruning: Whether to apply global pruning across all layers (for channel/kernel pruning)
+            
+        Returns:
+            Pruned model (not physically smaller yet)
+        """
+        logging.info(f"🔪 Pruning model using '{method}' method with pruning ratio {self.pruning_ratio}")
+        
+        if method == 'channel':
+            pruned_info = self._prune_channels(global_pruning)
+            # Calculate statistics
+            if pruned_info:
+                total_channels = sum(dict(self.prunable_layers)[name].weight.size(0) for name in pruned_info.keys())
+                total_pruned = sum(pruned_info.values())
+                overall_ratio = total_pruned / total_channels if total_channels > 0 else 0
+                logging.info(f"✅ Channel pruning complete: {total_pruned}/{total_channels} channels "
+                           f"pruned ({overall_ratio*100:.2f}%)")
+        
+        elif method == 'kernel':
+            pruned_info = self._prune_kernels(global_pruning)
+            # Calculate statistics
+            if pruned_info:
+                total_kernels = sum(dict(self.prunable_layers)[name].weight.size(0) for name in pruned_info.keys())
+                total_pruned = sum(pruned_info.values())
+                overall_ratio = total_pruned / total_kernels if total_kernels > 0 else 0
+                logging.info(f"✅ Kernel pruning complete: {total_pruned}/{total_kernels} kernels "
+                           f"pruned ({overall_ratio*100:.2f}%)")
+        
+        elif method == 'intra-kernel':
+            pruned_info = self._prune_intra_kernel()
+            # Calculate statistics
+            if pruned_info:
+                avg_ratio = sum(pruned_info.values()) / len(pruned_info) if pruned_info else 0
+                logging.info(f"✅ Intra-kernel pruning complete: average pruning ratio {avg_ratio*100:.2f}%")
+        
+        else:
+            logging.warning(f"⚠️ Unknown pruning method '{method}', no pruning applied")
+        
+        return self.model
+
+def calculate_pruning_metrics(model: nn.Module, input_size: Tuple[int, int, int, int] = (1, 3, 224, 224)) -> Dict[str, Any]:
+    """
+    Calculate metrics for a pruned model.
+    
+    Args:
+        model: Pruned PyTorch model
+        input_size: Input tensor size (batch_size, channels, height, width)
+        
+    Returns:
+        Dictionary with metrics (original and pruned params, FLOPs, reduction percentages)
+    """
+    logging.info("📊 Calculating pruning metrics...")
+    metrics = {}
+    device = next(model.parameters()).device
+    
+    # Try to import FLOPs calculation libraries
+    thop_available = False
+    fvcore_available = False
+    thop_module = None  # Initialize to avoid unbound errors
+    
+    try:
+        import thop as thop_module
+        thop_available = True
+        logging.info("✅ Using thop for FLOPs calculation")
+    except ImportError:
+        logging.warning("⚠️ thop not found, trying alternative FLOPs calculators")
+    
+    if not thop_available:
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            fvcore_available = True
+            logging.info("✅ Using fvcore for FLOPs calculation")
+        except ImportError:
+            logging.warning("⚠️ fvcore not found, will try custom FLOPs calculators")
+    
+    # Try custom metrics module as last resort
+    metrics_module = None
+    if not thop_available and not fvcore_available:
+        try:
+            import sys
+            import importlib.util
+            
+            # Try to find metrics.py in utils directory or other common locations
+            spec = importlib.util.find_spec("utils.metrics")
+            if spec is None:
+                for path in sys.path:
+                    try:
+                        metrics_path = os.path.join(path, "utils", "metrics.py")
+                        if os.path.exists(metrics_path):
+                            spec = importlib.util.spec_from_file_location("metrics", metrics_path)
+                            break
+                    except Exception:
+                        continue
+            
+            if spec is not None and spec.loader is not None:
+                metrics_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(metrics_module)
+                logging.info("✅ Using custom metrics module for calculations")
+        except Exception as e:
+            logging.error(f"❌ Error loading custom metrics module: {e}")
+            metrics_module = None
+    
+    # Create a copy of the unpruned model by restoring original weights
+    original_model = copy.deepcopy(model)
+    
+    # Check if model has pruning masks applied
+    has_pruning_masks = False
+    for module in original_model.modules():
+        if hasattr(module, 'weight_orig') and hasattr(module, 'weight_mask'):
+            has_pruning_masks = True
+            # Restore original weights (remove mask effect)
+            if isinstance(module.weight_orig, torch.Tensor):
+                with torch.no_grad():
+                    if hasattr(module, 'weight') and module.weight is not None:
+                        module.weight.data.copy_(module.weight_orig.data)
+            # Remove pruning
+            prune.remove(module, 'weight')
+    
+    if not has_pruning_masks:
+        logging.warning("⚠️ No pruning masks detected. If pruning was done by zeroing weights, metrics will still be calculated.")
+    
+    # Calculate original and pruned parameters
+    original_params = sum(p.numel() for p in original_model.parameters() if p.requires_grad)
+    pruned_params_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Count non-zero parameters in pruned model
+    nonzero_params = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            nonzero_params += torch.count_nonzero(param).item()
+    
+    metrics['original_params'] = original_params
+    metrics['pruned_params'] = nonzero_params
+    metrics['param_reduction'] = 100.0 * (1.0 - nonzero_params / original_params) if original_params > 0 else 0
+    # Calculate FLOPs using available methods
+    if thop_available and thop_module is not None:
+        # Use thop for FLOPs calculation
+        try:
+            # Create correctly sized input tensors
+            dummy_input = torch.randn(input_size).to(device)
+            
+            # Calculate FLOPs for original model
+            original_model.eval()
+            temp = thop_module.profile(original_model, inputs=(dummy_input,), verbose=False)
+            # thop sometimes returns 2 or 3 values, handle both cases
+            if isinstance(temp, tuple) and len(temp) >= 2:
+                macs = temp[0]
+                original_flops = macs * 2  # Convert MACs to FLOPs
+            
+                # Calculate FLOPs for pruned model
+                model.eval() 
+                temp = thop_module.profile(model, inputs=(dummy_input,), verbose=False)
+                macs = temp[0]
+                pruned_flops = macs * 2
+                
+                metrics['original_flops'] = original_flops
+                metrics['pruned_flops'] = pruned_flops
+                metrics['flops_reduction'] = 100.0 * (1.0 - pruned_flops / original_flops) if original_flops > 0 else 0
+                
+                logging.info(f"📊 Original model: Parameters {original_params:,}, FLOPs {original_flops/1e6:.2f}M")
+                logging.info(f"📊 Pruned model: Parameters {nonzero_params:,}, FLOPs {pruned_flops/1e6:.2f}M")
+                logging.info(f"📊 Reduction: Parameters {metrics['param_reduction']:.2f}%, FLOPs {metrics['flops_reduction']:.2f}%")
+            else:
+                logging.warning("⚠️ Unexpected output format from thop.profile")
+                thop_available = False
+        except Exception as e:
+            logging.error(f"❌ Error calculating FLOPs with thop: {e}")
+            thop_available = False
+            
+    elif fvcore_available:
+        # Use fvcore for FLOPs calculation
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            dummy_input = torch.randn(input_size).to(device)
+            
+            # Calculate FLOPs for original model
+            original_model.eval()
+            flops_analysis = FlopCountAnalysis(original_model, dummy_input)
+            original_flops = flops_analysis.total()
+            
+            # Calculate FLOPs for pruned model
+            model.eval()
+            flops_analysis = FlopCountAnalysis(model, dummy_input)
+            pruned_flops = flops_analysis.total()
+            
+            metrics['original_flops'] = original_flops
+            metrics['pruned_flops'] = pruned_flops
+            metrics['flops_reduction'] = 100.0 * (1.0 - pruned_flops / original_flops) if original_flops > 0 else 0
+            
+            logging.info(f"📊 Original model: Parameters {original_params:,}, FLOPs {original_flops/1e6:.2f}M")
+            logging.info(f"📊 Pruned model: Parameters {nonzero_params:,}, FLOPs {pruned_flops/1e6:.2f}M")
+            logging.info(f"📊 Reduction: Parameters {metrics['param_reduction']:.2f}%, FLOPs {metrics['flops_reduction']:.2f}%")
+        except Exception as e:
+            logging.error(f"❌ Error calculating FLOPs with fvcore: {e}")
+            fvcore_available = False
+            
+    elif metrics_module is not None and hasattr(metrics_module, 'calculate_flops'):
+        # Use custom metrics module
+        try:
+            original_flops = metrics_module.calculate_flops(original_model, input_size)
+            pruned_flops = metrics_module.calculate_flops(model, input_size)
+            
+            metrics['original_flops'] = original_flops
+            metrics['pruned_flops'] = pruned_flops
+            metrics['flops_reduction'] = 100.0 * (1.0 - pruned_flops / original_flops) if original_flops > 0 else 0
+            
+            logging.info(f"📊 Original model: Parameters {original_params:,}, FLOPs {original_flops/1e6:.2f}M")
+            logging.info(f"📊 Pruned model: Parameters {nonzero_params:,}, FLOPs {pruned_flops/1e6:.2f}M")
+            logging.info(f"📊 Reduction: Parameters {metrics['param_reduction']:.2f}%, FLOPs {metrics['flops_reduction']:.2f}%")
+        except Exception as e:
+            logging.error(f"❌ Error calculating FLOPs with custom metrics: {e}")
+    
+    # If all FLOPs calculation methods failed, estimate based on parameter reduction
+    if 'flops_reduction' not in metrics:
+        # Estimate FLOPs reduction based on parameter reduction
+        param_reduction_ratio = nonzero_params / original_params if original_params > 0 else 0
+        metrics['flops_reduction'] = 100.0 * (1.0 - param_reduction_ratio)
+        
+        # Rough FLOPs estimation for different layer types
+        estimated_original_flops = 0
+        estimated_pruned_flops = 0
+        
+        for name, module in original_model.named_modules():
+            if isinstance(module, nn.Conv2d):
+                # Estimate FLOPs for Conv2d
+                k_h, k_w = module.kernel_size if isinstance(module.kernel_size, tuple) else (module.kernel_size, module.kernel_size)
+                in_c = module.in_channels
+                out_c = module.out_channels
+                groups = module.groups
+                
+                # Output feature map size (roughly estimated)
+                output_h = input_size[2] // module.stride[0] if isinstance(module.stride, tuple) else input_size[2] // module.stride
+                output_w = input_size[3] // module.stride[0] if isinstance(module.stride, tuple) else input_size[3] // module.stride
+                
+                # Conventional FLOPs calculation for Conv2d
+                flops_per_position = (k_h * k_w * in_c * out_c) // groups
+                total_flops = flops_per_position * output_h * output_w * input_size[0]  # batch_size * h * w * flops_per_position
+                estimated_original_flops += total_flops
+                
+                # For pruned model, adjust based on non-zero weights
+                pruned_module = None
+                for name2, mod in model.named_modules():
+                    if name2 == name and isinstance(mod, nn.Conv2d):
+                        pruned_module = mod
+                        break
+                        
+                if pruned_module is not None and hasattr(pruned_module, 'weight'):
+                    nonzero_ratio = torch.count_nonzero(pruned_module.weight).item() / pruned_module.weight.numel()
+                    estimated_pruned_flops += total_flops * nonzero_ratio
+            
+            elif isinstance(module, nn.Linear):
+                # Estimate FLOPs for Linear layers
+                flops = 2 * module.in_features * module.out_features * input_size[0]  # multiply-add operations
+                estimated_original_flops += flops
+                
+                # For pruned model
+                pruned_module = None
+                for name2, mod in model.named_modules():
+                    if name2 == name and isinstance(mod, nn.Linear):
+                        pruned_module = mod
+                        break
+                        
+                if pruned_module is not None and hasattr(pruned_module, 'weight'):
+                    nonzero_ratio = torch.count_nonzero(pruned_module.weight).item() / pruned_module.weight.numel()
+                    estimated_pruned_flops += flops * nonzero_ratio
+        
+        # If we managed to estimate some FLOPs
+        if estimated_original_flops > 0:
+            metrics['original_flops'] = estimated_original_flops
+            metrics['pruned_flops'] = estimated_pruned_flops
+            metrics['flops_reduction'] = 100.0 * (1.0 - estimated_pruned_flops / estimated_original_flops)
+            
+            logging.info(f"📊 Estimated Original FLOPs: {estimated_original_flops/1e6:.2f}M")
+            logging.info(f"📊 Estimated Pruned FLOPs: {estimated_pruned_flops/1e6:.2f}M")
+            logging.info(f"📊 Estimated FLOPs reduction: {metrics['flops_reduction']:.2f}%")
+    else:
+            # Last resort - use parameter reduction as proxy for FLOPs reduction
+            logging.warning("⚠️ Using parameter reduction as proxy for FLOPs reduction")
+            metrics['flops_reduction'] = metrics['param_reduction']
+    
+    # Log per-layer pruning statistics for convolutional layers
+    logging.info("📊 Per-layer pruning statistics:")
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            weight = module.weight.data
+            total_weights = weight.numel()
+            active_weights = torch.count_nonzero(weight).item()
+            
+            if total_weights > 0:
+                pruned_ratio = 1.0 - (active_weights / total_weights)
+                logging.info(f"    Layer {name}: kept {active_weights}/{total_weights} weights "
+                           f"(pruned {pruned_ratio*100:.1f}%)")
+    
+    return metrics
+
+def get_model_pruning_ratio(model: nn.Module) -> float:
+    """
+    Calculate the overall pruning ratio of a model.
+    
+    Args:
+        model: PyTorch model with pruning applied
+        
+    Returns:
+        Pruning ratio (0.0 - 1.0)
+    """
+    total_weights = 0
+    zero_weights = 0
+    
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            weight = module.weight.data
+            total_weights += weight.numel()
+            zero_weights += (weight == 0).sum().item()
+    
+    return zero_weights / total_weights if total_weights > 0 else 0.0
